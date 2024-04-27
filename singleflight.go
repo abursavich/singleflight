@@ -1,25 +1,33 @@
-// Copyright (c) Tailscale Inc & AUTHORS
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: MIT
+//
+// Copyright 2024 Andrew Bursavich. All rights reserved.
+// Use of this source code is governed by The MIT License
+// which can be found in the LICENSE file.
+
+// Copyright (c) Tailscale Inc & AUTHOR
+// BSD-3-Clause: https://github.com/tailscale/tailscale/blob/v1.32.0/LICENSE
 
 // Copyright 2013 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// BSD-3-Clause: https://cs.opensource.google/go/x/sync/+/refs/tags/v0.7.0:LICENSE
 
-// Package singleflight provides a duplicate function call suppression
-// mechanism.
+// Package singleflight provides a duplicate function call suppression mechanism.
 //
-// This is a Tailscale fork of Go's singleflight package which has had several
+// This is a fork of Tailscale's fork of Go's singleflight package which has had several
 // homes in the past:
 //
+//   - https://pkg.go.dev/tailscale.com/util/singleflight
 //   - https://github.com/golang/go/commit/61d3b2db6292581fc07a3767ec23ec94ad6100d1
 //   - https://github.com/golang/groupcache/tree/master/singleflight
 //   - https://pkg.go.dev/golang.org/x/sync/singleflight
 //
-// This fork adds generics.
-package singleflight // import "tailscale.com/util/singleflight"
+// The tailscale fork adds generics.
+//
+// This fork adds contexts.
+package singleflight
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -57,16 +65,16 @@ func newPanicError(v interface{}) error {
 
 // call is an in-flight or completed singleflight.Do call
 type call[V any] struct {
-	wg sync.WaitGroup
+	done chan (struct{})
 
-	// These fields are written once before the WaitGroup is done
-	// and are only read after the WaitGroup is done.
+	// These fields are written once before the done channel is closed
+	// and are only read after the done channel is closed.
 	val V
 	err error
 
 	// These fields are read and written with the singleflight
-	// mutex held before the WaitGroup is done, and are read but
-	// not written after the WaitGroup is done.
+	// mutex held before the done channel is closed, and are read
+	// but not written after the done channel is closed.
 	dups  int
 	chans []chan<- Result[V]
 }
@@ -91,7 +99,7 @@ type Result[V any] struct {
 // time. If a duplicate comes in, the duplicate caller waits for the
 // original to complete and receives the same results.
 // The return value shared indicates whether v was given to multiple callers.
-func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bool) {
+func (g *Group[K, V]) Do(ctx context.Context, key K, fn func(context.Context) (V, error)) (v V, err error, shared bool) {
 	g.mu.Lock()
 	if g.m == nil {
 		g.m = make(map[K]*call[V])
@@ -99,7 +107,12 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 	if c, ok := g.m[key]; ok {
 		c.dups++
 		g.mu.Unlock()
-		c.wg.Wait()
+
+		select {
+		case <-c.done:
+		case <-ctx.Done():
+			return v, ctx.Err(), false
+		}
 
 		if e, ok := c.err.(*panicError); ok {
 			panic(e)
@@ -109,11 +122,10 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 		return c.val, c.err, true
 	}
 	c := new(call[V])
-	c.wg.Add(1)
 	g.m[key] = c
 	g.mu.Unlock()
 
-	g.doCall(c, key, fn)
+	g.doCall(ctx, c, key, fn)
 	return c.val, c.err, c.dups > 0
 }
 
@@ -121,7 +133,7 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 // results when they are ready.
 //
 // The returned channel will not be closed.
-func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
+func (g *Group[K, V]) DoChan(ctx context.Context, key K, fn func(context.Context) (V, error)) <-chan Result[V] {
 	ch := make(chan Result[V], 1)
 	g.mu.Lock()
 	if g.m == nil {
@@ -131,37 +143,41 @@ func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
 		c.dups++
 		c.chans = append(c.chans, ch)
 		g.mu.Unlock()
+
 		return ch
 	}
-	c := &call[V]{chans: []chan<- Result[V]{ch}}
-	c.wg.Add(1)
+	c := &call[V]{
+		done:  make(chan struct{}),
+		chans: []chan<- Result[V]{ch},
+	}
 	g.m[key] = c
 	g.mu.Unlock()
 
-	go g.doCall(c, key, fn)
+	go g.doCall(ctx, c, key, fn)
 
 	return ch
 }
 
 // doCall handles the single call for a key.
-func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
+func (g *Group[K, V]) doCall(ctx context.Context, c *call[V], key K, fn func(context.Context) (V, error)) {
 	normalReturn := false
 	recovered := false
 
-	// use double-defer to distinguish panic from runtime.Goexit,
-	// more details see https://golang.org/cl/134395
+	// Use double-defer to distinguish panic from runtime.Goexit,
+	// For more details see https://golang.org/cl/134395.
 	defer func() {
-		// the given function invoked runtime.Goexit
+		// The given function invoked runtime.Goexit.
 		if !normalReturn && !recovered {
 			c.err = errGoexit
 		}
 
 		g.mu.Lock()
-		defer g.mu.Unlock()
-		c.wg.Done()
 		if g.m[key] == c {
 			delete(g.m, key)
 		}
+		g.mu.Unlock()
+
+		close(c.done)
 
 		if e, ok := c.err.(*panicError); ok {
 			// In order to prevent the waiting channels from being blocked forever,
@@ -169,16 +185,16 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 			if len(c.chans) > 0 {
 				go panic(e)
 				select {} // Keep this goroutine around so that it will appear in the crash dump.
-			} else {
-				panic(e)
 			}
-		} else if c.err == errGoexit {
-			// Already in the process of goexit, no need to call again
-		} else {
-			// Normal return
-			for _, ch := range c.chans {
-				ch <- Result[V]{c.val, c.err, c.dups > 0}
-			}
+			panic(e)
+		}
+		if c.err == errGoexit {
+			// Already in the process of goexit, no need to call again.
+			// This is may leak goroutines waiting on a result from DoChan.
+			return
+		}
+		for _, ch := range c.chans {
+			ch <- Result[V]{c.val, c.err, c.dups > 0}
 		}
 	}()
 
@@ -198,7 +214,7 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 			}
 		}()
 
-		c.val, c.err = fn()
+		c.val, c.err = fn(ctx)
 		normalReturn = true
 	}()
 
